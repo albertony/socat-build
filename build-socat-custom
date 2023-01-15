@@ -1,0 +1,269 @@
+#!/bin/sh
+#
+# Build socat (www.dest-unreach.org/socat) from source as customized binary.
+#
+# After a successful build, the binary will be copied to current working directory,
+# and then stripped (symbols removed).
+#
+# Building statically linked binary by default, by automatically setting linker flag
+# -static in LDFLAGS. This can be overriden by setting LDFLAGS when executing this script,
+# and even if set to empty value then the the existing value will be used, the
+# LDFLAGS=-static will only be used by default when building if variable LDFLAGS is unset.
+# No other build options are set, i.e. makefile/compiler/os defaults will be used, which
+# on most modern distros with updated compiler should result in a reasonable hardened
+# binary.
+#
+# Looking up latest version by default, but can configure a specific version with
+# environment variable SOCAT_VERSION. If also setting the expected SHA-256 checksum in
+# variable SOCAT_SHA256SUM then this will be verified.
+#
+# Easily configurable which of socat's optional features shall be included in the
+# created customized binary. This script is designed to build minimalistic variants,
+# where one can enable only the exact features needed need for a specific use case.
+# It will therefore by default first disable absolutely all optional default-enabled
+# features, with the documented --disable-FEATURE flags from the configure help (see
+# source file "configure"), and then enable specific features by appending
+# --enable-FEATURE flags. The features to enable can be specified by the caller with
+# environment variable SOCAT_ENABLE_FEATURES, the the default is
+# "--enable-help --enable-ip4" which enables the feature help, because it is convenient
+# to support the "socat -h" command, and the feature ip4, because socat does not build
+# at all without it (at least when testing socat 1.7.4.4 on Alpine 3.17.0 using gcc
+# version 12.2.1). Also the features to disable initially can be overridden, with
+# variable SOCAT_DISABLE_FEATURES, and it can be set empty to not disable any features.
+#
+# Does not build any of the external dependencies, OpenSSL, Readline and Ncurses,
+# required for some of the optional features (such as --enable-openssl).
+#
+# For example, to build a variant with the absolute minimum set of features required to
+# connect a unix domain socket with a socat unix-listen address to a process pipeline
+# with an socat exec address, which is what socat is used for in the VPNKit setup,
+# one can set environment variable:
+#   SOCAT_ENABLE_FEATURES="--enable-ip4 --enable-help --enable-unix --enable-listen --enable-exec" ./build-socat-custom
+# This will enable features:
+#  - ip4: because socat does not build at all without it (at least socat 1.7.4.4 on Alpine 3.17.0 using gcc version 12.2.1)
+#  - help: to support command "socat -h", just for convenience
+#  - unix: to support unix domain sockets, required for unix-* address types
+#  - listen: to support listening and accepting connections, to combine with unix comain sockets it is required for the unix-listen address type
+#  - exec: to support forking a sub-process, to which socat can write data to via its stdin and read from its stdout, required for the exec address type
+#
+# Another example, to build a variant with all the features that socat enables by default,
+# i.e. bypass the "minimalistic" approach taken by this script by default:
+#   SOCAT_DISABLE_FEATURES= SOCAT_ENABLE_FEATURES= ./build-socat-custom
+#
+# This script can be run from an Alpine image (e.g. Docker container, WSL distro,
+# alpine-minirootfs), and when starting from a clean system only the build-base
+# package are required. Since Alpine uses musl as C standard library, the resulting
+# binary will be of minimum size and maximum flexibility, portable and copy-installable
+# across different Linux distros.
+#
+# Includes automatic integration when run within GitHub Action; after a successfull build
+# it will report information to the job summary as well as setting step output parameters,
+# e.g. SOCAT_FILE and SOCAT_CHECKSUM that can be used to publish the result.
+#
+
+# Script configuration
+# If any command has a non-zero exit code then exit immediately.
+set -e
+# If any command in a pipeline fails then let its exit code represent the whole pipeline.
+# This prevents errors in a pipeline from being masked, but it may also break some
+# code, e.g. lead to exit code 141 as described here:
+# http://www.greenend.org.uk/rjk/tech/shellmistakes.html#pipeerrors
+#set -o pipefail
+# Treat unset variables as an error and exit immediately.
+set -u
+# For debugging, print all executed commands to the terminal.
+#set -x
+
+# Get release information, if not version is specified then find latest version.
+# (Using a sed regex which is a bit complex, to ensure proper versioned sort without
+# relying on having the sort tool with --version-sort capability).
+SOCAT_VERSION=${SOCAT_VERSION:-}
+if [ -n "$SOCAT_VERSION" ]; then
+    echo "Looking up release information for version ${SOCAT_VERSION}"
+    SOCAT_RELEASE=$(wget -q -T 5 -O - http://www.dest-unreach.org/socat/download.sha256sum | sed -rn "s/^([0-9a-f]{64})\s+(socat-${SOCAT_VERSION}\.tar\.gz)$/${SOCAT_VERSION};\2;\1/p")
+    SOCAT_RELEASE=${SOCAT_RELEASE:?FAILED: Unable to find release with version ${SOCAT_VERSION}}
+else
+    echo "Finding latest release"
+    # Note: If using "set -o pipefail" and "set -e" the following might fail with exit code 141, see: http://www.greenend.org.uk/rjk/tech/shellmistakes.html#pipeerrors
+    SOCAT_RELEASE=$(wget -q -T 5 -O - http://www.dest-unreach.org/socat/download.sha256sum | sed -rn "s/^([0-9a-f]{64})\s+(socat-(([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3}))\.tar\.gz)$/00\4.00\5.00\6.00\7;\3;\2;\1/p" | sed -rn "s/^(0*)([0-9]{3})\.(0*)([0-9]{3})\.(0*)([0-9]{3})\.(0*)([0-9]{3});(.*)$/\2.\4.\6.\8;\9/p" | sort -r | head -n 1 | cut -d';' -f2-)
+    SOCAT_RELEASE=${SOCAT_RELEASE:?FAILED: Unable to find latest release}
+fi
+SOCAT_VERSION=$(echo "$SOCAT_RELEASE" | cut -d';' -f1)
+SOCAT_VERSION=${SOCAT_VERSION:?FAILED: Unable to find version number of latest release}
+SOCAT_ARCHIVE_NAME=$(echo "$SOCAT_RELEASE" | cut -d';' -f2)
+SOCAT_ARCHIVE_NAME=${SOCAT_ARCHIVE_NAME:?FAILED: Unable to find archive name of latest release}
+SOCAT_SHA256SUM_INPUT=${SOCAT_SHA256SUM:-}
+SOCAT_SHA256SUM=$(echo "$SOCAT_RELEASE" | cut -d';' -f3)
+SOCAT_SHA256SUM=${SOCAT_SHA256SUM:?FAILED: Unable to find checksum of latest release}
+if [ -n "$SOCAT_SHA256SUM_INPUT" ]; then
+    # If variable SOCAT_SHA256SUM was set when calling this script, normally together
+    # with SOCAT_VERSION, then check that its value matches the checksum published
+    # for the release we have found.
+    # NOTE: We have kept the original value in new variable SOCAT_SHA256SUM_INPUT, before
+    # fetching the published checksum into SOCAT_SHA256SUM.
+    if [ "$SOCAT_SHA256SUM" != "$SOCAT_SHA256SUM_INPUT" ]; then
+        echo "FAILED: Published checksum of source archive ${SOCAT_SHA256SUM} does not match the expected ${SOCAT_SHA256SUM_INPUT} set in variable SOCAT_SHA256SUM"
+        exit 1
+    fi
+    echo "Published checksum (SHA256) of source archive matches the expected ${SOCAT_SHA256SUM_INPUT} set in variable SOCAT_SHA256SUM"
+fi
+
+# Create build directory and change it to be working directory for the build commands
+mkdir -p build
+cd build
+
+# Download source and verify checksum
+echo "Downloading source archive ${SOCAT_ARCHIVE_NAME}"
+wget -O $SOCAT_ARCHIVE_NAME http://www.dest-unreach.org/socat/download/${SOCAT_ARCHIVE_NAME}
+checksum=$(sha256sum $SOCAT_ARCHIVE_NAME | cut -d' ' -f1)
+if [ "$checksum" != "$SOCAT_SHA256SUM" ]; then
+    echo "FAILED: Checksum ${checksum} of source archive does not match the published ${SOCAT_SHA256SUM}"
+    exit 1
+fi
+echo "Checksum (SHA-256) of source archive matches the published ${checksum}"
+
+# Extract
+tar xzvf ${SOCAT_ARCHIVE_NAME}
+
+# Configure and build
+cd ${SOCAT_ARCHIVE_NAME%.*.*}
+# Configure
+echo "Configuring"
+# First disabling features according to the environment variable SOCAT_DISABLE_FEATURES,
+# where default is absolutely all optional default-enabled features, with the documented
+# --disable-FEATURE flags from the configure help (see source file "configure").
+# Then enable specific features by appending --enable-FEATURE flags, according to
+# environment variable SOCAT_ENABLE_FEATURES, where default is "--enable-help --enable-ip4"
+# which enables the feature help, because it is convenient to support the "socat -h"
+# command, and the feature ip4, because socat does not build at all without it (at least
+# when testing socat 1.7.4.4 on Alpine 3.17.0 using gcc version 12.2.1).
+# Note that the defaults will only be used if variables are unset ("-" instead of ":-"
+# in shell parameter expansion), this to allow them to be set empty to just remove what
+# this script set by default values!
+SOCAT_DISABLE_FEATURES=${SOCAT_DISABLE_FEATURES-\
+    --disable-help\
+    --disable-stdio\
+    --disable-fdnum\
+    --disable-file\
+    --disable-creat\
+    --disable-gopen\
+    --disable-pipe\
+    --disable-termios\
+    --disable-unix\
+    --disable-abstract-unixsocket\
+    --disable-ip4\
+    --disable-ip6\
+    --disable-rawip\
+    --disable-genericsocket\
+    --disable-interface\
+    --disable-tcp\
+    --disable-udp\
+    --disable-sctp\
+    --disable-vsock\
+    --disable-listen\
+    --disable-socks4\
+    --disable-socks4a\
+    --disable-proxy\
+    --disable-exec\
+    --disable-system\
+    --disable-pty\
+    --disable-fs\
+    --disable-readline\
+    --disable-openssl\
+    --disable-fips\
+    --disable-tun\
+    --disable-sycls\
+    --disable-filan\
+    --disable-retry\
+    --disable-libwrap\
+}
+SOCAT_ENABLE_FEATURES=${SOCAT_ENABLE_FEATURES-\
+    --enable-help\
+    --enable-ip4\
+}
+echo "Disabling features: ${SOCAT_DISABLE_FEATURES}"
+echo "Enabling features: ${SOCAT_ENABLE_FEATURES}"
+# Default is to configure for static linking by setting linker flag -static in LDFLAGS.
+# If LDFLAGS is already set then will use that existing value, even if empty to allow
+# caller to set it empty to thereby configure without any LDFLAGS and instead use
+# makefile/compiler defaults (as above; use of "-" instead of ":-" in shell parameter
+# expansion is what makes default value being used only if variables are unset).
+LDFLAGS=${LDFLAGS--static} ./configure ${SOCAT_DISABLE_FEATURES} ${SOCAT_ENABLE_FEATURES}
+# Build
+echo "Building"
+make -j4
+SOCAT_EXE_BUILD_PATH=$(readlink -f socat)
+cd ..
+
+# Done building, move out of build directory
+cd ..
+
+# Check result
+echo "Checking results"
+# Running it with argument -h and -V to retrieve help text, version and feature information.
+chmod +x ${SOCAT_EXE_BUILD_PATH}
+help=$(${SOCAT_EXE_BUILD_PATH} -h)
+features=$(${SOCAT_EXE_BUILD_PATH} -V)
+version=$(echo "$features" | head -2 | grep -o 'socat version .*' | cut -d' ' -f3)
+if [ "$version" != "$SOCAT_VERSION" ]; then
+    echo "FAILED: Actual built version ${version} is not the expected ${SOCAT_VERSION}"
+    exit 1
+fi
+
+# Copy final results to original working directory, and strip it (remove symbols)
+cp ${SOCAT_EXE_BUILD_PATH} .
+echo "Copying binary to working directory and stripping it, size before: $(stat -c %s socat)"
+strip socat
+echo "Size after stripping: $(stat -c %s socat)"
+
+# Run the program (quick self-test) and gather information
+SOCAT_EXE_OUTPUT_PATH=$(readlink -f socat)
+SOCAT_EXE_OUTPUT_CHECKSUM=$(sha256sum $SOCAT_EXE_OUTPUT_PATH | cut -d' ' -f1)
+SOCAT_EXE_OUTPUT_CHECKSUM_FILE=${SOCAT_EXE_OUTPUT_PATH}.sha256sum
+echo "${SOCAT_EXE_OUTPUT_CHECKSUM}  socat" > $SOCAT_EXE_OUTPUT_CHECKSUM_FILE
+SOCAT_EXE_BINARY_TYPE=$(file ${SOCAT_EXE_OUTPUT_PATH} | cut -d' ' -f2-)
+SOCAT_EXE_SIZE=$(stat -c "%s" ${SOCAT_EXE_OUTPUT_PATH})
+SOCAT_EXE_TIMESTAMP=$(stat -c "%y" ${SOCAT_EXE_OUTPUT_PATH})
+
+# Report result with some details
+# Turning off error handling for this since socat -V returns exit code 1,
+# and also turns off printing of commands for prettier output.
+set +ex
+echo
+echo "$features"
+echo
+echo "$help"
+echo
+echo "Successfully built socat v${SOCAT_VERSION}"
+echo "Path: ${SOCAT_EXE_OUTPUT_PATH}"
+echo "Size: ${SOCAT_EXE_SIZE}"
+echo "Timestamp: ${SOCAT_EXE_TIMESTAMP}"
+echo "Checksum: ${SOCAT_EXE_OUTPUT_CHECKSUM}"
+echo "Binary: ${SOCAT_EXE_BINARY_TYPE}"
+
+# Custom integration when running from GitHub workflow
+GITHUB_OUTPUT=${GITHUB_OUTPUT:-}
+if [ -n "$GITHUB_OUTPUT" ]; then
+
+    # Write custom summary
+    echo "#### socat v${SOCAT_VERSION}" >> $GITHUB_STEP_SUMMARY
+    echo "Size: ${SOCAT_EXE_SIZE}" >> $GITHUB_STEP_SUMMARY
+    echo "Timestamp: ${SOCAT_EXE_TIMESTAMP}" >> $GITHUB_STEP_SUMMARY
+    echo "Checksum: ${SOCAT_EXE_OUTPUT_CHECKSUM}" >> $GITHUB_STEP_SUMMARY
+    echo "Binary: ${SOCAT_EXE_BINARY_TYPE}" >> $GITHUB_STEP_SUMMARY
+    echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+    echo "$features" >> $GITHUB_STEP_SUMMARY
+    echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+    echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+    echo "$help" >> $GITHUB_STEP_SUMMARY
+    echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+    # Set step output parameter
+    echo "SOCAT_VERSION=${SOCAT_VERSION}" >> $GITHUB_OUTPUT
+    echo "SOCAT_FILE=${SOCAT_EXE_OUTPUT_PATH}" >> $GITHUB_OUTPUT
+    echo "SOCAT_SIZE=${SOCAT_EXE_SIZE}" >> $GITHUB_OUTPUT
+    echo "SOCAT_TIMESTAMP=${SOCAT_EXE_TIMESTAMP}" >> $GITHUB_OUTPUT
+    echo "SOCAT_CHECKSUM=${SOCAT_EXE_OUTPUT_CHECKSUM}" >> $GITHUB_OUTPUT
+    echo "SOCAT_CHECKSUM_FILE=${SOCAT_EXE_OUTPUT_CHECKSUM_FILE}" >> $GITHUB_OUTPUT
+    echo "SOCAT_BINARY_TYPE=${SOCAT_EXE_BINARY_TYPE}" >> $GITHUB_OUTPUT
+fi

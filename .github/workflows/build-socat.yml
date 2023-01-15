@@ -1,0 +1,201 @@
+name: Build socat
+on: push
+jobs:
+
+  #
+  # Building 64-bit linux musl static stripped custom socat variants.
+  #
+  # Creating Linux x86_64 (64-bit) statically linked and stripped binary.
+  # Using an Alpine container since it uses musl as C standard library,
+  # which makes the built binary minimally sized and with maximal
+  # portability with regards to running on different Linux distros.
+  #
+  # Building variants with different features enabled via env SOCAT_ENABLE_FEATURES,
+  # and/or SOCAT_DISABLE_FEATURES.
+  #
+  # See "build-socat-custom" script for details.
+  #
+
+  socat-custom-x86_64-linux-musl-static-stripped:
+    #if: ${{ false }}  # TEMP: Disable
+    name: Custom (64-bit linux musl static stripped)
+    runs-on: ubuntu-latest
+    container: alpine:latest
+    strategy:
+      matrix:
+        variant: [ defaults, unix-listen-and-exec, stdio-and-exec ]
+        include:
+          - variant: defaults
+            # Do not explicitely disable and enable any features, use socat defaults
+            # which is basically to perform checks and enable all possible features.
+            feature-variables: SOCAT_DISABLE_FEATURES= SOCAT_ENABLE_FEATURES=
+          - variant: unix-listen-and-exec
+            # Enable features:
+            #  - ip4: because socat does not build at all without it (at least socat 1.7.4.4 on Alpine 3.17.0 using gcc version 12.2.1)
+            #  - help: to support command "socat -h", just for convenience
+            #  - unix: to support unix domain sockets, required for unix-* address types
+            #  - listen: to support listening and accepting connections, to combine with unix comain sockets it is required for the unix-listen address type
+            #  - exec: to support forking a sub-process, to which socat can write data to via its stdin and read from its stdout, required for the exec address type
+            feature-variables: SOCAT_ENABLE_FEATURES="--enable-ip4 --enable-help --enable-unix --enable-listen --enable-exec"
+          - variant: stdio-and-exec
+            # Enable features:
+            #  - ip4: because socat does not build at all without it (at least socat 1.7.4.4 on Alpine 3.17.0 using gcc version 12.2.1)
+            #  - help: to support command "socat -h", just for convenience
+            #  - stdio: to support standard input/output streams, file descriptors 0, 1 and 2, required for stdio, stdin, stdout and stderr address types
+            #  - exec: to support forking a sub-process, to which socat can write data to via its stdin and read from its stdout, required for the exec address type
+            feature-variables: SOCAT_ENABLE_FEATURES="--enable-ip4 --enable-help --enable-stdio --enable-exec"
+    steps:
+      - id: checkout
+        name: Checkout build script
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - id: setup
+        name: Setup build tools
+        run: apk upgrade --no-cache && apk add --no-cache build-base
+      - id: build
+        name: Build socat
+        run: ${{ matrix.feature-variables }} ./build-socat-custom
+      - id: upload
+        name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: socat-custom-with-${{ matrix.variant }}-x86_64-linux-musl-static-stripped-v${{ steps.build.outputs.SOCAT_VERSION }}
+          path: |
+            ${{ steps.build.outputs.SOCAT_FILE }}
+            ${{ steps.build.outputs.SOCAT_CHECKSUM_FILE }}
+          if-no-files-found: error # 'warn' or 'ignore' are also available, defaults to `warn`
+          retention-days: 30 # Default is 90
+
+  #
+  # Building 64-bit Windows MSYS2/Cygwin stripped custom socat variants.
+  #
+  # NOTE: The resulting binary will not be statically linked, as it will have a
+  # dependency to the MSYS2/Cygwin runtime library, msys2.0.dll.
+  #
+
+  socat-custom-x86_64-windows-msys2-stripped:
+    #if: ${{ false }}  # TEMP: Disable
+    name: Custom (64-bit windows msys2 stripped)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    strategy:
+      matrix:
+        variant: [ defaults, unix-listen-and-exec, stdio-and-exec ]
+        include:
+          - variant: defaults
+            # Do not explicitely disable and enable any features, use socat defaults
+            # which is basically to perform checks and enable all possible features.
+            feature-variables: SOCAT_DISABLE_FEATURES= SOCAT_ENABLE_FEATURES=
+          - variant: unix-listen-and-exec
+            # Enable features:
+            #  - ip4: because socat does not build at all without it (at least socat 1.7.4.4 on Alpine 3.17.0 using gcc version 12.2.1)
+            #  - help: to support command "socat -h", just for convenience
+            #  - unix: to support unix domain sockets, required for unix-* address types
+            #  - listen: to support listening and accepting connections, to combine with unix comain sockets it is required for the unix-listen address type
+            #  - exec: to support forking a sub-process, to which socat can write data to via its stdin and read from its stdout, required for the exec address type
+            feature-variables: SOCAT_ENABLE_FEATURES="--enable-ip4 --enable-help --enable-unix --enable-listen --enable-exec"
+          - variant: stdio-and-exec
+            # Enable features:
+            #  - ip4: because socat does not build at all without it (at least socat 1.7.4.4 on Alpine 3.17.0 using gcc version 12.2.1)
+            #  - help: to support command "socat -h", just for convenience
+            #  - stdio: to support standard input/output streams, file descriptors 0, 1 and 2, required for stdio, stdin, stdout and stderr address types
+            #  - exec: to support forking a sub-process, to which socat can write data to via its stdin and read from its stdout, required for the exec address type
+            feature-variables: SOCAT_ENABLE_FEATURES="--enable-ip4 --enable-help --enable-stdio --enable-exec"
+    steps:
+      - id: checkout
+        name: Checkout build script
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - id: setup
+        name: Setup msys2 with build tools
+        uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          install: >-
+            base-devel
+            gcc
+      - id: build
+        name: Build socat
+        run: ${{ matrix.feature-variables }} ./build-socat-custom
+      - id: convert-paths
+        name: Convert msys2-specific file paths to windows form
+        run: |
+          echo "SOCAT_FILE_WIN=$(cygpath --windows ${{ steps.build.outputs.SOCAT_FILE }})" >> $GITHUB_OUTPUT
+          echo "SOCAT_CHECKSUM_FILE_WIN=$(cygpath --windows ${{ steps.build.outputs.SOCAT_CHECKSUM_FILE }})" >> $GITHUB_OUTPUT
+          echo "MSYS_RUNTIME_FILE_WIN=$(cygpath --windows /usr/bin/msys-2.0.dll)" >> $GITHUB_OUTPUT
+      - id: upload-build
+        name: Upload artifacts (build output)
+        uses: actions/upload-artifact@v3
+        with:
+          name: socat-custom-with-${{ matrix.variant }}-x86_64-windows-msys2-stripped-v${{ steps.build.outputs.SOCAT_VERSION }}
+          path: |
+            ${{ steps.convert-paths.outputs.SOCAT_FILE_WIN }}
+            ${{ steps.convert-paths.outputs.SOCAT_CHECKSUM_FILE_WIN }}
+          if-no-files-found: error # 'warn' or 'ignore' are also available, defaults to `warn`
+          retention-days: 30 # Default is 90
+      - id: upload-dependencies
+        name: Upload artifacts (dependencies)
+        uses: actions/upload-artifact@v3
+        with:
+          # Bundle MSYS2 runtime dependency. Using a separate step, since path is
+          # unrelated to primary build output, and the upload-artifact action uses the
+          # least common ancestor as root directory of the artifact archive, which would
+          # lead to an unwanted subdirectory structure in the archive.
+          name: socat-custom-with-${{ matrix.variant }}-x86_64-windows-msys2-stripped-v${{ steps.build.outputs.SOCAT_VERSION }}
+          path: ${{ steps.convert-paths.outputs.MSYS_RUNTIME_FILE_WIN }}
+          if-no-files-found: error # 'warn' or 'ignore' are also available, defaults to `warn`
+          retention-days: 30 # Default is 90
+
+  #
+  # Building 64-bit linux musl static stripped socat variant with standard set of features.
+  #
+  # Creating Linux x86_64 (64-bit) statically linked and stripped binary.
+  # Using an Alpine container since it uses musl as C standard library,
+  # which makes the built binary minimally sized and with maximal
+  # portability with regards to running on different Linux distros.
+  #
+  # Building dependencies OpenSSL and Readline required for some of the features, and
+  # Ncurses required by Readline.
+  #
+  # See "build-socat" script for details.
+  #
+  socat-standard:
+    #if: ${{ false }}  # TEMP: Disable
+    name: Standard (64-bit linux musl static stripped)
+    runs-on: ubuntu-latest
+    container: alpine:latest
+    strategy:
+      matrix:
+        variant: [ openssl-v1, openssl-v3 ]
+        include:
+          - variant: openssl-v1
+            openssl-major-version: 1
+          - variant: openssl-v3
+            openssl-major-version: 3
+    steps:
+      - id: checkout
+        name: Checkout build script
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - id: setup
+        name: Setup build tools
+        # Note: This requires linux-headers and perl, in addition to build-base, for building the OpenSSL dependency.
+        run: apk upgrade --no-cache && apk add --no-cache build-base linux-headers perl
+      - id: build
+        name: Build socat with dependencies
+        run: OPENSSL_MAJOR_VERSION=${{ matrix.openssl-major-version }} ./build-socat
+      - id: upload
+        name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: socat-standard-with-openssl-v${{ matrix.openssl-major-version }}-x86_64-linux-musl-static-stripped-v${{ steps.build.outputs.SOCAT_VERSION }}
+          path: |
+            ${{ steps.build.outputs.SOCAT_FILE }}
+            ${{ steps.build.outputs.SOCAT_CHECKSUM_FILE }}
+          if-no-files-found: error # 'warn' or 'ignore' are also available, defaults to `warn`
+          retention-days: 30 # Default is 90

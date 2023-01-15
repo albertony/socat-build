@@ -1,0 +1,330 @@
+#!/bin/sh
+#
+# Build socat (www.dest-unreach.org/socat) from source as statically linked
+# and stripped binary.
+#
+# After a successful build, the binary will be copied to current working directory,
+# and then stripped (symbols removed).
+#
+# Building with complete set of features supported on current platform,
+# including features requiring external dependencies, except FIPS and LIBWRAP
+# which are normally not included in other builds (e.g. in distro package repositories)
+# either. The external dependencies considered are OpenSSL and GNU Readline, as well as
+# ncurses which is a dependency for readline. This script will build these from source
+# before socat, and statically link them into a single socat binary.
+#
+# Looking up latest versions by default, but can configure specific versions with
+# environment variables SOCAT_VERSION, OPENSSL_VERSION, READLINE_VERSION and
+# NCURSES_VERSION. If also setting the expected SHA-256 checksum in variable
+# with suffix "_SHA256SUM" then this will be verified (only supported for socat and
+# OpenSSL currently). For OpenSSL there is an alternative version variable
+# OPENSSL_MAJOR_VERSION to set when not wanting to specify a specific version with
+# OPENSSL_VERSION, but want to decide which major version to consider when looking for
+# latest release. There are currently two maintained major versions: 1 (e.g. 1.1.1s)
+# and 3 (e.g. 3.0.7). Default is to look for latest release of major version 3.
+#
+# This script can be run from an Alpine image (e.g. Docker container, WSL distro,
+# alpine-minirootfs), and when starting from a clean system only the following packages
+# are required: build-base, linux-headers and perl. Since Alpine uses musl as C standard
+# library, the resulting binary will be of minimum size and maximum flexibility, portable
+# and copy-installable across different Linux distros.
+#
+# Includes automatic integration when run within GitHub Action; after a successfull build
+# it will report information to the job summary as well as setting step output parameters,
+# e.g. SOCAT_FILE and SOCAT_CHECKSUM that can be used to publish the result.
+#
+
+# Script configuration
+# If any command has a non-zero exit code then exit immediately.
+set -e
+# If any command in a pipeline fails then let its exit code represent the whole pipeline.
+# This prevents errors in a pipeline from being masked, but it may also break some
+# code, e.g. lead to exit code 141 as described here:
+# http://www.greenend.org.uk/rjk/tech/shellmistakes.html#pipeerrors
+#set -o pipefail
+# Treat unset variables as an error and exit immediately.
+set -u
+# For debugging, print all executed commands to the terminal.
+#set -x
+
+# Get socat release information.
+# If not version is specified then find latest version.
+# (Using a sed regex which is a bit complex, to ensure proper versioned sort without
+# relying on having the sort tool with --version-sort capability).
+# Website: http://www.dest-unreach.org/socat/
+# Distribution site: http://www.dest-unreach.org/socat/download/
+# Distribution checksum database: http://www.dest-unreach.org/socat/download.sha256sum
+# We retrieve the release information from checksum database, instead of the distribution
+# site file list, since we then can get the checksum at the same time.
+SOCAT_VERSION=${SOCAT_VERSION:-}
+if [ -n "$SOCAT_VERSION" ]; then
+    echo "Looking up release information for socat version ${SOCAT_VERSION}"
+    SOCAT_RELEASE=$(wget -q -T 5 -O - http://www.dest-unreach.org/socat/download.sha256sum | sed -rn "s/^([0-9a-f]{64})\s+(socat-${SOCAT_VERSION}\.tar\.gz)$/${SOCAT_VERSION};\2;\1/p")
+    SOCAT_RELEASE=${SOCAT_RELEASE:?FAILED: Unable to find release with version ${SOCAT_VERSION} of socat}
+else
+    echo "Finding latest release of socat"
+    # Note: If using "set -o pipefail" and "set -e" the following might fail with exit code 141, see: http://www.greenend.org.uk/rjk/tech/shellmistakes.html#pipeerrors
+    SOCAT_RELEASE=$(wget -q -T 5 -O - http://www.dest-unreach.org/socat/download.sha256sum | sed -rn "s/^([0-9a-f]{64})\s+(socat-(([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3}))\.tar\.gz)$/00\4.00\5.00\6.00\7;\3;\2;\1/p" | sed -rn "s/^(0*)([0-9]{3})\.(0*)([0-9]{3})\.(0*)([0-9]{3})\.(0*)([0-9]{3});(.*)$/\2.\4.\6.\8;\9/p" | sort -r | head -n 1 | cut -d';' -f2-)
+    SOCAT_RELEASE=${SOCAT_RELEASE:?FAILED: Unable to find latest release of socat}
+fi
+SOCAT_VERSION=$(echo "$SOCAT_RELEASE" | cut -d';' -f1)
+SOCAT_VERSION=${SOCAT_VERSION:?FAILED: Unable to find version number of latest release of socat}
+SOCAT_ARCHIVE_NAME=$(echo "$SOCAT_RELEASE" | cut -d';' -f2)
+SOCAT_ARCHIVE_NAME=${SOCAT_ARCHIVE_NAME:?FAILED: Unable to find archive name of latest release of socat}
+SOCAT_SHA256SUM_INPUT=${SOCAT_SHA256SUM:-}
+SOCAT_SHA256SUM=$(echo "$SOCAT_RELEASE" | cut -d';' -f3)
+SOCAT_SHA256SUM=${SOCAT_SHA256SUM:?FAILED: Unable to find checksum of latest release of socat}
+if [ -n "$SOCAT_SHA256SUM_INPUT" ]; then
+    # If variable SOCAT_SHA256SUM was set when calling this script, normally together
+    # with SOCAT_VERSION, then check that its value matches the checksum published
+    # for the release we have found.
+    # NOTE: We have kept the original value in new variable SOCAT_SHA256SUM_INPUT, before
+    # fetching the published checksum into SOCAT_SHA256SUM.
+    if [ "$SOCAT_SHA256SUM" != "$SOCAT_SHA256SUM_INPUT" ]; then
+        echo "FAILED: Published checksum of socat source archive ${SOCAT_SHA256SUM} does not match the expected ${SOCAT_SHA256SUM_INPUT} set in variable SOCAT_SHA256SUM"
+        exit 1
+    fi
+    echo "Published checksum (SHA256) of socat source archive matches the expected ${SOCAT_SHA256SUM_INPUT} set in variable SOCAT_SHA256SUM"
+fi
+echo "Socat version ${SOCAT_VERSION}, archive ${SOCAT_ARCHIVE_NAME}, checksum ${SOCAT_SHA256SUM}"
+
+# Get OpenSSL release information.
+# Website: https://www.openssl.org/
+# Distribution site: [https|ftp]://ftp.openssl.org/source/
+# We prefer http(s) for smaller information requests and ftp for later larger downloads.
+OPENSSL_VERSION=${OPENSSL_VERSION:-}
+if [ -n "$OPENSSL_VERSION" ]; then
+    OPENSSL_MAJOR_VERSION=${OPENSSL_VERSION%%.*}
+    echo "Looking up release information for openssl v${OPENSSL_MAJOR_VERSION} version ${OPENSSL_VERSION}"
+    OPENSSL_RELEASE=$(wget -q -T 5 -O - https://ftp.openssl.org/source/ | sed -rn "s/^.*<a href=\"(openssl-${OPENSSL_VERSION}\.tar\.gz)\">.*$/${OPENSSL_VERSION};\1/p")
+    OPENSSL_RELEASE=${OPENSSL_RELEASE:?FAILED: Unable to find release with version ${OPENSSL_VERSION} of openssl}
+else
+    # Make sure we are explicit about which major version we consider, there are currently
+    # two maintained branches: v1 (e.g. 1.1.1s) and v3 (e.g. 3.0.7).
+    OPENSSL_MAJOR_VERSION=${OPENSSL_MAJOR_VERSION:-3}
+    if [ "$OPENSSL_MAJOR_VERSION" = "1" ]; then
+        echo "Finding latest release of openssl v1"
+        OPENSSL_RELEASE=$(wget -q -T 5 -O - https://ftp.openssl.org/source/ | sed -rn "s/^.*<a href=\"(openssl-((1)\.([0-9]{1,3})\.([0-9]{1,3}[a-z]))\.tar\.gz)\">.*$/00\3.00\4.00\5;\2;\1/p" | sed -rn "s/^(0*)([0-9]{3})\.(0*)([0-9]{3})\.(0*)([0-9]{3}[a-z]);(.*)$/\2.\4.\6;\7/p" | sort -r | head -n 1 | cut -d';' -f2-)
+    elif [ "$OPENSSL_MAJOR_VERSION" = "3" ]; then
+        echo "Finding latest release of openssl v3"
+        OPENSSL_RELEASE=$(wget -q -T 5 -O - https://ftp.openssl.org/source/ | sed -rn "s/^.*<a href=\"(openssl-((3)\.([0-9]{1,3})\.([0-9]{1,3}))\.tar\.gz)\">.*$/00\3.00\4.00\5;\2;\1/p" | sed -rn "s/^(0*)([0-9]{3})\.(0*)([0-9]{3})\.(0*)([0-9]{3});(.*)$/\2.\4.\6;\7/p" | sort -r | head -n 1 | cut -d';' -f2-)
+        OPENSSL_RELEASE=${OPENSSL_RELEASE:?FAILED: Unable to find latest release of openssl}
+    else
+        echo "FAILED: Invalid openssl version ${OPENSSL_VERSION} specified, there is no major version ${OPENSSL_MAJOR_VERSION}"
+        exit 1
+    fi
+fi
+OPENSSL_VERSION=$(echo "$OPENSSL_RELEASE" | cut -d';' -f1)
+OPENSSL_VERSION=${OPENSSL_VERSION:?FAILED: Unable to find version number of latest release of openssl}
+OPENSSL_ARCHIVE_NAME=$(echo "$OPENSSL_RELEASE" | cut -d';' -f2)
+OPENSSL_ARCHIVE_NAME=${OPENSSL_ARCHIVE_NAME:?FAILED: Unable to find archive name of latest release of openssl}
+OPENSSL_SHA256SUM_INPUT=${OPENSSL_SHA256SUM:-}
+OPENSSL_SHA256SUM=$(wget -q -T 5 -O - https://ftp.openssl.org/source/${OPENSSL_ARCHIVE_NAME}.sha256)
+OPENSSL_SHA256SUM=${OPENSSL_SHA256SUM## } # Trim leading space, which the v3 checksum files do have!
+OPENSSL_SHA256SUM=${OPENSSL_SHA256SUM:?FAILED: Unable to find checksum of latest release of openssl}
+if [ -n "$OPENSSL_SHA256SUM_INPUT" ]; then
+    # If variable OPENSSL_SHA256SUM was set when calling this script, normally together
+    # with OPENSSL_VERSION, then check that its value matches the checksum published
+    # for the release we have found.
+    # NOTE: We have kept the original value in new variable OPENSSL_SHA256SUM_INPUT, before
+    # fetching the published checksum into OPENSSL_SHA256SUM.
+    if [ "$OPENSSL_SHA256SUM" != "$OPENSSL_SHA256SUM_INPUT" ]; then
+        echo "FAILED: Published checksum of openssl source archive ${OPENSSL_SHA256SUM} does not match the expected ${OPENSSL_SHA256SUM_INPUT} set in variable OPENSSL_SHA256SUM"
+        exit 1
+    fi
+    echo "Published checksum (SHA256) of openssl source archive matches the expected ${OPENSSL_SHA256SUM_INPUT} set in variable OPENSSL_SHA256SUM"
+fi
+echo "Openssl version ${OPENSSL_VERSION}, archive ${OPENSSL_ARCHIVE_NAME}, checksum ${OPENSSL_SHA256SUM}"
+
+# Get GNU Readline release information.
+# Website: https://tiswww.case.edu/php/chet/readline/rltop.html
+# Distribution site: ftp://ftp.cwru.edu/pub/bash/
+# GNU distribution site: [https|ftp]://ftp.gnu.org/gnu/readline/
+# We prefer http(s) for smaller information requests and ftp for later larger downloads,
+# and for consistency same domain for both, and will therefore use the GNU site.
+READLINE_VERSION=${READLINE_VERSION:-}
+if [ -n "$READLINE_VERSION" ]; then
+    echo "Looking up release information for readline version ${READLINE_VERSION}"
+    READLINE_RELEASE=$(wget -q -T 5 -O - https://ftp.gnu.org/gnu/readline | sed -rn "s/^.*<a href=\"(readline-${READLINE_VERSION}\.tar\.gz)\">.*$/${READLINE_VERSION};\1/p")
+    READLINE_RELEASE=${READLINE_RELEASE:?FAILED: Unable to find release with version ${READLINE_VERSION} of readline}
+else
+    echo "Finding latest release of readline"
+    READLINE_RELEASE=$(wget -q -T 5 -O - https://ftp.gnu.org/gnu/readline | sed -rn "s/^.*<a href=\"(readline-(([0-9]{1,3})\.([0-9]{1,3}))\.tar\.gz)\">.*$/00\3.00\4;\2;\1/p" | sed -rn "s/^(0*)([0-9]{3})\.(0*)([0-9]{3});(.*)$/\2.\4;\5/p" | sort -r | head -n 1 | cut -d';' -f2-)
+    READLINE_RELEASE=${READLINE_RELEASE:?FAILED: Unable to find latest release of readline}
+fi
+READLINE_VERSION=$(echo "$READLINE_RELEASE" | cut -d';' -f1)
+READLINE_VERSION=${READLINE_VERSION:?FAILED: Unable to find version number of latest release of readline}
+READLINE_ARCHIVE_NAME=$(echo "$READLINE_RELEASE" | cut -d';' -f2)
+READLINE_ARCHIVE_NAME=${READLINE_ARCHIVE_NAME:?FAILED: Unable to find archive name of latest release of readline}
+echo "Readline version ${READLINE_VERSION}, archive ${READLINE_ARCHIVE_NAME}"
+
+# Get ncurses release information.
+# Website: https://invisible-island.net/ncurses/
+# Distribution site: https://invisible-island.net/archives/ncurses/
+# Mirror: https://invisible-mirror.net/
+# GNU distribution site: [https|ftp]://ftp.gnu.org/gnu/ncurses/
+# There was a ftp://ftp.invisible-island.net/ alternative as well, but it was shut down
+# in January 2023.
+# We prefer http(s) for smaller information requests and ftp for later larger downloads,
+# and for consistency same domain for both, and will therefore use the GNU site.
+NCURSES_VERSION=${NCURSES_VERSION:-}
+if [ -n "$NCURSES_VERSION" ]; then
+    echo "Looking up release information for ncurses version ${NCURSES_VERSION}"
+    NCURSES_RELEASE=$(wget -q -T 5 -O - https://ftp.gnu.org/pub/gnu/ncurses | sed -rn "s/^.*<a href=\"(ncurses-${NCURSES_VERSION}\.tar\.gz)\">.*$/${NCURSES_VERSION};\1/p")
+    NCURSES_RELEASE=${NCURSES_RELEASE:?FAILED: Unable to find release with version ${NCURSES_VERSION} of ncurses}
+else
+    echo "Finding latest release of ncurses"
+    NCURSES_RELEASE=$(wget -q -T 5 -O - https://ftp.gnu.org/pub/gnu/ncurses | sed -rn "s/^.*<a href=\"(ncurses-(([0-9]{1,3})\.([0-9]{1,3}))\.tar\.gz)\">.*$/00\3.00\4;\2;\1/p" | sed -rn "s/^(0*)([0-9]{3})\.(0*)([0-9]{3});(.*)$/\2.\4;\5/p" | sort -r | head -n 1 | cut -d';' -f2-)
+    NCURSES_RELEASE=${NCURSES_RELEASE:?FAILED: Unable to find latest release of ncurses}
+fi
+NCURSES_VERSION=$(echo "$NCURSES_RELEASE" | cut -d';' -f1)
+NCURSES_VERSION=${NCURSES_VERSION:?FAILED: Unable to find version number of latest release of ncurses}
+NCURSES_ARCHIVE_NAME=$(echo "$NCURSES_RELEASE" | cut -d';' -f2)
+NCURSES_ARCHIVE_NAME=${NCURSES_ARCHIVE_NAME:?FAILED: Unable to find archive name of latest release of ncurses}
+echo "Ncurses version ${NCURSES_VERSION}, archive ${NCURSES_ARCHIVE_NAME}"
+
+# Download and build from source, first all dependencies and then socat linking with them.
+# Create build directory and change it to be working directory during this.
+mkdir -p build
+cd build
+
+# Download and build ncurses
+wget ftp://ftp.gnu.org/pub/gnu/ncurses/${NCURSES_ARCHIVE_NAME}
+tar zxvf ${NCURSES_ARCHIVE_NAME}
+cd ${NCURSES_ARCHIVE_NAME%.*.*}
+./configure --without-cxx --without-cxx-binding --without-ada  --without-manpages --without-progs --without-tests --without-debug
+make -j4
+cd ..
+
+# Download and build readline
+wget ftp://ftp.gnu.org/gnu/readline/${READLINE_ARCHIVE_NAME}
+tar xzvf ${READLINE_ARCHIVE_NAME}
+cd ${READLINE_ARCHIVE_NAME%.*.*}
+./configure --disable-shared --enable-static
+make -j4
+cd ..
+# Note that socat looks for readline in <readline/readline.h>, so we need
+# that directory to exist. We create a symlink in parent (build) directory
+# and make sure to set that as an include path when building socat later.
+ln -s $(readlink -f readline-${READLINE_VERSION}) readline
+
+# Download and build OpenSSL
+wget -O $OPENSSL_ARCHIVE_NAME ftp://ftp.openssl.org/source/${OPENSSL_ARCHIVE_NAME}
+checksum=$(sha256sum $OPENSSL_ARCHIVE_NAME | cut -d' ' -f1)
+if [ "$checksum" != "$OPENSSL_SHA256SUM" ]; then
+    echo "FAILED: Openssl checksum ${checksum} is not the expected ${OPENSSL_SHA256SUM}"
+    exit 1
+fi
+echo "Openssl checksum (SHA256) of openssl verified: ${checksum}"
+tar xzvf ${OPENSSL_ARCHIVE_NAME}
+cd ${OPENSSL_ARCHIVE_NAME%.*.*}
+./config -static
+make -j4
+cd ..
+
+# Download and build socat
+wget -O $SOCAT_ARCHIVE_NAME http://www.dest-unreach.org/socat/download/${SOCAT_ARCHIVE_NAME}
+checksum=$(sha256sum $SOCAT_ARCHIVE_NAME | cut -d' ' -f1)
+if [ "$checksum" != "$SOCAT_SHA256SUM" ]; then
+    echo "FAILED: Socat checksum ${checksum} is not the expected ${SOCAT_SHA256SUM}"
+    exit 1
+fi
+echo "Socat checksum (SHA256) verified: ${checksum}"
+tar xzvf ${SOCAT_ARCHIVE_NAME}
+cd ${SOCAT_ARCHIVE_NAME%.*.*}
+CPPFLAGS="-I.. -I../openssl-${OPENSSL_VERSION}/include"\
+    LDFLAGS="-static -L../readline-${READLINE_VERSION} -L../ncurses-${NCURSES_VERSION}/lib -L../openssl-${OPENSSL_VERSION}"\
+    ./configure
+make -j4
+SOCAT_EXE_BUILD_PATH=$(readlink -f socat)
+cd ..
+
+# Done building, move out of build directory
+cd ..
+
+# Check result
+echo "Checking results"
+# Running it with argument -h and -V to retrieve help text, version and feature information.
+chmod +x ${SOCAT_EXE_BUILD_PATH}
+help=$(${SOCAT_EXE_BUILD_PATH} -h)
+features=$(${SOCAT_EXE_BUILD_PATH} -V)
+# Verify version
+version=$(echo "$features" | head -2 | grep -o 'socat version .*' | cut -d' ' -f3)
+if [ "$version" != "$SOCAT_VERSION" ]; then
+    echo "FAILED: Built socat binary reports version ${version} but expected ${SOCAT_VERSION}"
+    exit 1
+fi
+# Verify that readline and OpenSSL dependencies were found and socat built with
+# the features depending on them. If not found then socat will just disable the
+# features and continue the build, so here we verify they are actually enabled.
+# When built with Readline it should report "#define WITH_READLINE 1", and not "#undef WITH_READLINE"
+if ! echo "$features" | grep -q "#define WITH_READLINE 1"; then
+    echo "FAILED: Built socat binary does not report it was built with readline"
+    exit 1
+fi
+# When built with OpenSSL it should report "#define WITH_OPENSSL 1", and not "#undef WITH_OPENSSL"
+if ! echo "$features" | grep -q "#define WITH_OPENSSL 1"; then
+    echo "FAILED: Built socat binary does not report it was built with OpenSSL"
+    exit 1
+fi
+
+# Copy final results to original working directory, and strip it (remove symbols)
+cp ${SOCAT_EXE_BUILD_PATH} .
+echo "Copying built socat binary to working directory and stripping it, size before: $(stat -c %s socat)"
+strip socat
+echo "Size after stripping: $(stat -c %s socat)"
+
+# Run the program (quick self-test) and gather information
+SOCAT_EXE_OUTPUT_PATH=$(readlink -f socat)
+SOCAT_EXE_OUTPUT_CHECKSUM=$(sha256sum $SOCAT_EXE_OUTPUT_PATH | cut -d' ' -f1)
+SOCAT_EXE_OUTPUT_CHECKSUM_FILE=${SOCAT_EXE_OUTPUT_PATH}.sha256sum
+echo "${SOCAT_EXE_OUTPUT_CHECKSUM}  socat" > $SOCAT_EXE_OUTPUT_CHECKSUM_FILE
+SOCAT_EXE_BINARY_TYPE=$(file ${SOCAT_EXE_OUTPUT_PATH} | cut -d' ' -f2-)
+SOCAT_EXE_SIZE=$(stat -c "%s" ${SOCAT_EXE_OUTPUT_PATH})
+SOCAT_EXE_TIMESTAMP=$(stat -c "%y" ${SOCAT_EXE_OUTPUT_PATH})
+
+# Report result with some details
+# Turning off error handling for this since socat -V returns exit code 1,
+# and also turns off printing of commands for prettier output.
+set +ex
+echo
+echo "$features"
+echo
+echo "$help"
+echo
+echo "Successfully built socat v${SOCAT_VERSION} with OpenSSL v${OPENSSL_VERSION} GNU Readline v${READLINE_VERSION} ncurses v${NCURSES_VERSION}"
+echo "Path: ${SOCAT_EXE_OUTPUT_PATH}"
+echo "Size: ${SOCAT_EXE_SIZE}"
+echo "Timestamp: ${SOCAT_EXE_TIMESTAMP}"
+echo "Checksum: ${SOCAT_EXE_OUTPUT_CHECKSUM}"
+echo "Binary: ${SOCAT_EXE_BINARY_TYPE}"
+
+# Custom integration when running from GitHub workflow
+GITHUB_OUTPUT=${GITHUB_OUTPUT:-}
+if [ -n "$GITHUB_OUTPUT" ]; then
+
+    # Write custom summary
+    echo "#### socat v${SOCAT_VERSION} with OpenSSL v${OPENSSL_VERSION} GNU Readline v${READLINE_VERSION} ncurses v${NCURSES_VERSION}" >> $GITHUB_STEP_SUMMARY
+    echo "Size: ${SOCAT_EXE_SIZE}" >> $GITHUB_STEP_SUMMARY
+    echo "Timestamp: ${SOCAT_EXE_TIMESTAMP}" >> $GITHUB_STEP_SUMMARY
+    echo "Checksum: ${SOCAT_EXE_OUTPUT_CHECKSUM}" >> $GITHUB_STEP_SUMMARY
+    echo "Binary: ${SOCAT_EXE_BINARY_TYPE}" >> $GITHUB_STEP_SUMMARY
+    echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+    echo "$features" >> $GITHUB_STEP_SUMMARY
+    echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+    echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+    echo "$help" >> $GITHUB_STEP_SUMMARY
+    echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+    # Set step output parameter
+    echo "SOCAT_VERSION=${SOCAT_VERSION}" >> $GITHUB_OUTPUT
+    echo "SOCAT_FILE=${SOCAT_EXE_OUTPUT_PATH}" >> $GITHUB_OUTPUT
+    echo "SOCAT_SIZE=${SOCAT_EXE_SIZE}" >> $GITHUB_OUTPUT
+    echo "SOCAT_TIMESTAMP=${SOCAT_EXE_TIMESTAMP}" >> $GITHUB_OUTPUT
+    echo "SOCAT_CHECKSUM=${SOCAT_EXE_OUTPUT_CHECKSUM}" >> $GITHUB_OUTPUT
+    echo "SOCAT_CHECKSUM_FILE=${SOCAT_EXE_OUTPUT_CHECKSUM_FILE}" >> $GITHUB_OUTPUT
+    echo "SOCAT_BINARY_TYPE=${SOCAT_EXE_BINARY_TYPE}" >> $GITHUB_OUTPUT
+    echo "OPENSSL_VERSION=${OPENSSL_VERSION}" >> $GITHUB_OUTPUT
+    echo "READLINE_VERSION=${READLINE_VERSION}" >> $GITHUB_OUTPUT
+    echo "NCURSES_VERSION=${NCURSES_VERSION}" >> $GITHUB_OUTPUT
+fi
