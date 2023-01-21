@@ -26,12 +26,15 @@ which is bundled together with socat.exe in the artifact.
 
 ### Binaries
 
-You can find prebuilt binaries in the [Actions](https://github.com/albertony/socat-build/actions)
-section. Select the latest successful workflow run, and you should see downloadable
-artifacts as well as details about the socat build in each them below. Note that there
-is a retention period, currently 30 days, and after that the artifacts on a workflow run
-will no longer be available. So if I haven't triggered a build for a while, it could be
-that not binaries are available.
+You can find prebuilt binaries in the [Releases](https://github.com/albertony/socat-build/releases)
+section. My current strategy is to publish binaries in a single release, named "Binaries",
+which I replace whenever a new complete, successful build has been performed. The binaries
+in the release are taken from a workflow run, which you can find in the
+[Actions](https://github.com/albertony/socat-build/actions) section. While the release
+does not contain much information, the workflow runs will give you all the details from
+the build and about the artifacts produced. You can also find older runs, and download
+their artifacts, but there is a retention period for these artifacts, currently 30 days,
+while the assets on the release will be permanently available.
 
 ### Disclaimer
 
