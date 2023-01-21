@@ -1,5 +1,34 @@
 name: Build socat
-on: push
+on:
+  #push:
+  #  branches:
+  #    - '*'
+  #  tags:
+  #    - '*'
+  workflow_dispatch:
+    inputs:
+      # Let user choose which jobs to include when using the "Run workflow" button.
+      socat-custom-x86_64-linux-musl-static-stripped:
+        description: Custom (64-bit linux musl static stripped)
+        type: boolean
+        required: true
+        default: true
+      socat-custom-x86_64-windows-msys2-stripped:
+        description: Custom (64-bit windows msys2 stripped)
+        type: boolean
+        required: true
+        default: true
+      socat-standard-x86_64-linux-musl-static-stripped:
+        description: Standard (64-bit linux musl static stripped)
+        type: boolean
+        required: true
+        default: true
+      release:
+        description: Release
+        type: boolean
+        required: true
+        default: true
+      
 jobs:
 
   #
@@ -15,9 +44,9 @@ jobs:
   #
   # See "build-socat-custom" script for details.
   #
-
   socat-custom-x86_64-linux-musl-static-stripped:
-    #if: ${{ false }}  # TEMP: Disable
+    #if: ${{ false }} # Skip
+    if: ${{ github.event.inputs.socat-custom-x86_64-linux-musl-static-stripped == 'true' }}
     name: Custom (64-bit linux musl static stripped)
     runs-on: ubuntu-latest
     container: alpine:latest
@@ -73,9 +102,9 @@ jobs:
   # NOTE: The resulting binary will not be statically linked, as it will have a
   # dependency to the MSYS2/Cygwin runtime library, msys2.0.dll.
   #
-
   socat-custom-x86_64-windows-msys2-stripped:
-    #if: ${{ false }}  # TEMP: Disable
+    #if: ${{ false }} # Skip
+    if: ${{ github.event.inputs.socat-custom-x86_64-windows-msys2-stripped == 'true' }}
     name: Custom (64-bit windows msys2 stripped)
     runs-on: windows-latest
     defaults:
@@ -163,8 +192,9 @@ jobs:
   #
   # See "build-socat" script for details.
   #
-  socat-standard:
-    #if: ${{ false }}  # TEMP: Disable
+  socat-standard-x86_64-linux-musl-static-stripped:
+    #if: ${{ false }} # Skip
+    if: ${{ github.event.inputs.socat-standard-x86_64-linux-musl-static-stripped == 'true' }}
     name: Standard (64-bit linux musl static stripped)
     runs-on: ubuntu-latest
     container: alpine:latest
@@ -199,3 +229,96 @@ jobs:
             ${{ steps.build.outputs.SOCAT_CHECKSUM_FILE }}
           if-no-files-found: error # 'warn' or 'ignore' are also available, defaults to `warn`
           retention-days: 30 # Default is 90
+
+  #
+  # Create release
+  #
+  # Using GitHub REST API to find latest successful 
+  #
+  release:
+    #if: ${{ false }} # Skip
+    #if: ${{ always() }} # Always run, regardless of whether the other jobs were successful
+    #if: ${{ always() && github.event.inputs.release == 'true' }} # Run always when selected, regardless of whether the other jobs were successful
+    if: ${{ github.event.inputs.release == 'true' }} # Run only when selected and the other jobs were successful
+    name: Release
+    needs: [ socat-standard-x86_64-linux-musl-static-stripped, socat-custom-x86_64-windows-msys2-stripped, socat-custom-x86_64-linux-musl-static-stripped ]
+    runs-on: ubuntu-latest
+    permissions:
+      # The default permission granted to the GITHUB_TOKEN when running workflows in the
+      # repository is read permissions for the contents scope only (but can be changed to
+      # read/write for all scopes in repository settings/actions page). To publish releases
+      # we need write permissions to the contents scope, so we upgrade the token to this
+      # if necessary.
+      contents: write
+    steps:
+
+      # Approach using GitHub CLI without custom actions, but does not work because the "gh run download" command fails to find current run!
+      #
+      #- id: checkout
+      #  name: Checkout
+      #  uses: actions/checkout@v3
+      #  with:
+      #    fetch-depth: 0
+      #- id: release
+      #  name: Release
+      #  run: |
+      #    set -x
+      #    rm -rf artifacts && mkdir artifacts && cd artifacts
+      #    gh run download ${{ github.run_id }}
+      #    ls -alR
+      #    for dir in *; do
+      #      zip --recurse-paths --junk-paths $dir $dir
+      #      gh release upload v1 ${dir}.zip --clobber
+      #    done
+      #    gh release create --draft --prerelease --title "Release v1 ($(date +'%Y-%m-%dT%H:%M:%S%:z'))" v1
+      #    gh release upload v1 * --clobber
+      #  env:
+      #    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Alternative approach using the download-artifact action
+      - id: checkout
+        name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - id: download-artifacts
+        name: Download artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: artifacts
+      # But not using create-release and upload-release-asset actions for now:
+      #- id: create-release
+      #  name: Create Release
+      #  uses: actions/create-release@v1
+      #  env:
+      #    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      #  with:
+      #    tag_name: ${{ github.ref }}
+      #    release_name: Release ${{ github.ref }}
+      #    draft: true
+      #    prerelease: true
+      #- name: Upload release assets
+      #  id: upload-release-assets
+      #  uses: actions/upload-release-asset@v1
+      #  env:
+      #    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      #  with:
+      #    upload_url: ${{ steps.create-release.outputs.upload_url }} # This pulls from the CREATE RELEASE step above, referencing it's ID to get its outputs object, which include a `upload_url`. See this blog post for more info: https://jasonet.co/posts/new-features-of-github-actions/#passing-data-to-future-steps 
+      #    asset_path: ${{steps.download-artifacts.outputs.download-path}}
+      #    asset_name: my-artifact.zip
+      #    asset_content_type: application/zip
+      # Instead using GitHub CLI in a script, since we script zipping anyway...
+      - id: release
+        name: Release
+        working-directory: ${{ steps.download-artifacts.outputs.download-path }}
+        run: |
+          set -x
+          tag_name=binaries
+          gh release delete --yes ${tag_name} || true
+          gh release create --draft --prerelease --title "Binaries" --notes "This release contains binary assets built from latest version of upstream source code.\nCreated from workflow run [${{ github.run_id }}](https://github.com/albertony/socat-build/actions/runs/${{ github.run_id }}) (see the run page for more details)." ${tag_name}
+          for dir in *; do
+            zip --recurse-paths --junk-paths ${dir}.zip $dir
+            gh release upload ${tag_name} ${dir}.zip --clobber
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
